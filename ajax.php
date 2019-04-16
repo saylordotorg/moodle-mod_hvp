@@ -166,6 +166,31 @@ switch($action) {
         break;
 
     /*
+     * Saves a dynamically graded grade to the gradebook
+     *
+     * Type: HTTP POST
+     *
+     * Parameters:
+     *  - subcontent_id
+     *  - score
+     */
+    case 'updatesubcontentscore':
+        \mod_hvp\user_grades::handle_dynamic_grading();
+        break;
+
+    /*
+     * Returns a grade
+     *
+     * Type: HTTP GET
+     *
+     * Parameters:
+     *  - subcontent_id
+     */
+    case 'getsubcontentscore':
+        \mod_hvp\user_grades::return_subcontent_grade();
+        break;
+
+    /*
      * Provide data for results view
      *
      * Type: HTTP GET
@@ -201,10 +226,11 @@ switch($action) {
         $major = optional_param('majorVersion', 0, PARAM_INT);
         $minor = optional_param('minorVersion', 0, PARAM_INT);
         $editor = \mod_hvp\framework::instance('editor');
+        $language = optional_param('default-language', null, PARAM_RAW);
 
         if (!empty($name)) {
             $editor->ajax->action(H5PEditorEndpoints::SINGLE_LIBRARY, $name,
-                $major, $minor, \mod_hvp\framework::get_language());
+                $major, $minor, \mod_hvp\framework::get_language(), '', '', $language);
 
             new \mod_hvp\event(
                     'library', null,
@@ -284,6 +310,15 @@ switch($action) {
      */
     case 'xapiresult':
         \mod_hvp\xapi_result::handle_ajax();
+        break;
+
+    case 'translations':
+        if (!\mod_hvp\framework::has_editor_access('nopermissiontogettranslations')) {
+            break;
+        }
+        $language = required_param('language', PARAM_RAW);
+        $editor = \mod_hvp\framework::instance('editor');
+        $editor->ajax->action(H5PEditorEndpoints::TRANSLATIONS, $language);
         break;
 
 

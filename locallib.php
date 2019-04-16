@@ -42,20 +42,17 @@ function hvp_get_core_settings($context) {
     // Check permissions and generate ajax paths.
     $ajaxpaths = array();
     $savefreq = false;
-    if ($context->contextlevel == CONTEXT_MODULE) {
-        $ajaxpath = "{$basepath}mod/hvp/ajax.php?contextId={$context->instanceid}&token=";
+    $ajaxpath = "{$basepath}mod/hvp/ajax.php?contextId={$context->instanceid}&token=";
+    if ($context->contextlevel == CONTEXT_MODULE && has_capability('mod/hvp:saveresults', $context)) {
+        $ajaxpaths['setFinished'] = $ajaxpath . \H5PCore::createToken('result') . '&action=set_finished';
+        $ajaxpaths['xAPIResult'] = $ajaxpath . \H5PCore::createToken('xapiresult') . '&action=xapiresult';
+    }
+    if (has_capability('mod/hvp:savecontentuserdata', $context)) {
+        $ajaxpaths['contentUserData'] = $ajaxpath . \H5PCore::createToken('contentuserdata') .
+            '&action=contents_user_data&content_id=:contentId&data_type=:dataType&sub_content_id=:subContentId';
 
-        if (has_capability('mod/hvp:saveresults', $context)) {
-            $ajaxpaths['setFinished'] = $ajaxpath . \H5PCore::createToken('result') . '&action=set_finished';
-            $ajaxpaths['xAPIResult'] = $ajaxpath . \H5PCore::createToken('xapiresult') . '&action=xapiresult';
-        }
-        if (has_capability('mod/hvp:savecontentuserdata', $context)) {
-            $ajaxpaths['contentUserData'] = $ajaxpath . \H5PCore::createToken('contentuserdata') .
-                '&action=contents_user_data&content_id=:contentId&data_type=:dataType&sub_content_id=:subContentId';
-
-            if (get_config('mod_hvp', 'enable_save_content_state')) {
-                $savefreq = get_config('mod_hvp', 'content_state_frequency');
-            }
+        if (get_config('mod_hvp', 'enable_save_content_state')) {
+            $savefreq = get_config('mod_hvp', 'content_state_frequency');
         }
     }
 
@@ -64,7 +61,7 @@ function hvp_get_core_settings($context) {
     $settings = array(
         'baseUrl' => $basepath,
         'url' => "{$basepath}pluginfile.php/{$context->instanceid}/mod_hvp",
-        'libraryUrl' => "{$basepath}pluginfile.php/{$systemcontext->id}/mod_hvp/libraries",
+        'urlLibraries' => "{$basepath}pluginfile.php/{$systemcontext->id}/mod_hvp/libraries", // NOTE: Separate context from content URL !
         'postUserStatistics' => true,
         'ajax' => $ajaxpaths,
         'saveFreq' => $savefreq,
@@ -74,7 +71,12 @@ function hvp_get_core_settings($context) {
             'name' => $USER->firstname . ' ' . $USER->lastname,
             'mail' => $USER->email
         ),
-        'hubIsEnabled' => get_config('mod_hvp', 'hub_is_enabled') ? true : false
+        'hubIsEnabled' => get_config('mod_hvp', 'hub_is_enabled') ? true : false,
+        'reportingIsEnabled' => true,
+        'crossorigin' => isset($CFG->mod_hvp_crossorigin) ? $CFG->mod_hvp_crossorigin : null,
+        'libraryConfig' => $core->h5pF->getLibraryConfig(),
+        'pluginCacheBuster' => hvp_get_cache_buster(),
+        'libraryUrl' => $basepath . 'mod/hvp/library/js'
     );
 
     return $settings;
@@ -192,9 +194,11 @@ function hvp_add_editor_assets($id = null) {
       'ajaxPath' => "{$url}ajax.php?contextId={$context->id}&token={$editorajaxtoken}&action=",
       'libraryUrl' => $url . 'editor/',
       'copyrightSemantics' => $contentvalidator->getCopyrightSemantics(),
+      'metadataSemantics' => $contentvalidator->getMetadataSemantics(),
       'assets' => $assets,
       // @codingStandardsIgnoreLine
-      'apiVersion' => H5PCore::$coreApi
+      'apiVersion' => H5PCore::$coreApi,
+      'language' => $language,
     );
 
     if ($id !== null) {
@@ -303,6 +307,7 @@ function hvp_content_upgrade_progress($libraryid) {
     $out = new stdClass();
     $out->params = array();
     $out->token = \H5PCore::createToken('contentupgrade');
+    $out->metadata = array();
 
     // Prepare our interface.
     $interface = \mod_hvp\framework::instance('interface');
@@ -313,36 +318,59 @@ function hvp_content_upgrade_progress($libraryid) {
         // Update params.
         $params = json_decode($params);
         foreach ($params as $id => $param) {
-            $DB->update_record('hvp', (object) array(
+            $upgraded = json_decode($param);
+            $metadata = isset($upgraded->metadata) ? $upgraded->metadata : array();
+
+            $fields = array_merge(\H5PMetadata::toDBArray($metadata, false, false), array(
                 'id' => $id,
                 'main_library_id' => $tolibrary->id,
-                'json_content' => $param,
+                'json_content' => json_encode($upgraded->params),
                 'filtered' => ''
             ));
 
+            $DB->update_record('hvp', $fields);
+
             // Log content upgrade successful.
             new \mod_hvp\event(
-                    'content', 'upgrade',
-                    $id, $DB->get_field_sql("SELECT name FROM {hvp} WHERE id = ?", array($id)),
-                    $tolibrary->machine_name, $tolibrary->major_version . '.' . $tolibrary->minor_version
+                'content', 'upgrade',
+                $id, $DB->get_field_sql("SELECT name FROM {hvp} WHERE id = ?", array($id)),
+                $tolibrary->machine_name, $tolibrary->major_version . '.' . $tolibrary->minor_version
             );
         }
     }
 
+    // Determine if any content has been skipped during the process.
+    $skipped = filter_input(INPUT_POST, 'skipped');
+    if ($skipped !== null) {
+        $out->skipped = json_decode($skipped);
+        // Clean up input, only numbers.
+        foreach ($out->skipped as $i => $id) {
+            $out->skipped[$i] = intval($id);
+        }
+        $skipped = implode(',', $out->skipped);
+    } else {
+        $out->skipped = array();
+    }
+
     // Get number of contents for this library.
-    $out->left = $interface->getNumContent($libraryid);
+    $out->left = $interface->getNumContent($libraryid, $skipped);
 
     if ($out->left) {
+        $skipquery = empty($skipped) ? '' : " AND id NOT IN ($skipped)";
+
         // Find the 40 first contents using this library version and add to params.
         $results = $DB->get_records_sql(
-            "SELECT id, json_content as params
+            "SELECT id, json_content as params, name as title, authors, source, year_from, year_to,
+                    license, license_version, changes, license_extras, author_comments, default_language
                FROM {hvp}
               WHERE main_library_id = ?
+                    {$skipquery}
            ORDER BY name ASC", array($libraryid), 0 , 40
         );
 
         foreach ($results as $content) {
-            $out->params[$content->id] = $content->params;
+            $out->params[$content->id] = '{"params":' . $content->params .
+                                         ',"metadata":' . \H5PMetadata::toJSON($content) . '}';
         }
     }
 
@@ -373,10 +401,6 @@ function hvp_get_library_upgrade_info($name, $major, $minor) {
     $core = \mod_hvp\framework::instance();
 
     $library->semantics = $core->loadLibrarySemantics($library->name, $library->version->major, $library->version->minor);
-    if ($library->semantics === null) {
-        http_response_code(404);
-        return;
-    }
 
     $context = \context_system::instance();
     $libraryfoldername = "{$library->name}-{$library->version->major}.{$library->version->minor}";
